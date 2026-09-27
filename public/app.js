@@ -87,6 +87,7 @@ es.addEventListener('init', (e) => {
   for (const o of d.offers) state.offers.set(o.id, o);
   if (!state.selectedId) autoSelect();
   renderAll();
+  renderModals(); // 页面打开/刷新时若有待确认的传输，补弹确认框
 });
 es.addEventListener('peers', (e) => {
   replacePeers(JSON.parse(e.data).peers);
@@ -156,7 +157,7 @@ function renderMe() {
   // 输入框正在编辑时不覆盖用户输入（心跳每几秒触发一次全量渲染）
   if (document.activeElement !== nameEl) nameEl.value = state.me.name;
   const ip = (state.me.ips || []).join('，') || '未接入局域网';
-  $('#me-meta').innerHTML = `IP：${esc(ip)}<br>接收目录：${esc(state.me.saveDir)}`;
+  $('#me-meta').innerHTML = `IP：${esc(ip)}<br>接收目录：${esc(state.me.saveDir)}${state.me.saveDirFixed ? '（固定）' : ''}`;
 }
 
 function currentPeer() {
@@ -308,16 +309,26 @@ function addChat(peerId, msg) {
 // ---------------- 收件确认弹窗 ----------------
 function renderModals() {
   const pending = [...state.offers.values()].filter((o) => o.status === 'pending');
+  const fixed = !!(state.me && state.me.saveDirFixed);
+  const prefill = state.me ? (state.me.lastSaveDir || state.me.saveDir || '') : '';
   modalRoot.innerHTML = pending.map((o) => {
     const rows = o.files.slice(0, 50).map((f) =>
       `<div><span>${esc(f.path)}</span><span class="fsize">${fmtSize(f.size)}</span></div>`).join('');
     const more = o.files.length > 50 ? `<div><span>… 共 ${o.files.length} 个文件</span><span></span></div>` : '';
+    const pathBlock = fixed
+      ? `<p class="m-fixed">保存到：${esc(state.me.saveDir)}（已在配置中固定，不再询问）</p>`
+      : `<div class="m-path">
+          <label class="m-label">保存到（可修改）</label>
+          <input class="m-save-dir" value="${esc(prefill)}" spellcheck="false">
+          <label class="m-remember"><input type="checkbox" class="m-remember-box"> 记住此路径，以后不再询问</label>
+        </div>`;
     return `
     <div class="modal-overlay">
       <div class="modal">
         <h3>📥 收到文件请求</h3>
         <p class="m-sub">来自 <strong>${esc(o.from.name)}</strong> · 共 ${o.files.length} 个文件 · ${fmtSize(o.totalSize)}</p>
         <div class="m-files">${rows}${more}</div>
+        ${pathBlock}
         <div class="m-actions">
           <button class="btn danger" data-act="reject" data-id="${esc(o.id)}">拒绝</button>
           <button class="btn primary" data-act="accept" data-id="${esc(o.id)}">接受</button>
@@ -334,11 +345,26 @@ modalRoot.addEventListener('click', async (e) => {
   const act = btn.dataset.act;
   const offer = state.offers.get(id);
   if (!offer) return;
+  const modal = btn.closest('.modal');
+
+  let body = {};
+  if (act === 'accept' && !(state.me && state.me.saveDirFixed)) {
+    const dir = ((modal.querySelector('.m-save-dir') || {}).value || '').trim();
+    if (!dir) { toast('请填写保存路径', 'bad'); return; }
+    body.saveDir = dir;
+    body.always = !!(modal.querySelector('.m-remember-box') || {}).checked;
+  }
+
   btn.disabled = true;
   try {
     if (act === 'accept') {
-      await fetchJSON(`/api/transfer/accept/${id}`, 'POST', {});
+      const r = await fetchJSON(`/api/transfer/accept/${id}`, 'POST', body);
       offer.status = 'accepted';
+      if (state.me && r.saveDir) {
+        state.me.saveDir = r.saveDir;
+        state.me.saveDirFixed = !!r.saveDirFixed;
+        renderMe();
+      }
       toast(`已接受「${offer.from.name}」的传输`, 'ok');
     } else {
       await fetchJSON(`/api/transfer/reject/${id}`, 'POST', {});

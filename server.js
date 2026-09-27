@@ -23,7 +23,7 @@ const crypto = require('crypto');
 const { exec } = require('child_process');
 
 // ---------------- 常量 ----------------
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 const HTTP_PORT_BASE = parseInt(process.env.PORT || '3210', 10);
 const UDP_PORT_BASE = parseInt(process.env.UDP_PORT || '32101', 10);
 const UDP_PORT_RANGE = 5;              // UDP 同时向 32101..32105 发送/监听
@@ -41,13 +41,27 @@ const PLATFORM_NAME =
 
 // ---------------- 配置 ----------------
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
-const config = { id: null, name: null, saveDir: null };
+const config = { id: null, name: null, saveDir: null, saveDirFixed: false, lastSaveDir: null };
 try {
   Object.assign(config, JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')));
 } catch (_) { /* 首次运行无配置 */ }
 if (!config.id) config.id = crypto.randomUUID();
-if (!config.saveDir) config.saveDir = SAVE_DIR_DEFAULT;
-if (process.env.SAVE_DIR) config.saveDir = process.env.SAVE_DIR;
+
+// 接收目录模式：
+//  - 固定模式（saveDirFixed=true，来自 SAVE_DIR 环境变量、config.json 显式配置或弹窗勾选"记住"）：
+//    收到文件直接存入 config.saveDir，不再询问
+//  - 询问模式（默认）：每次接受时可修改路径，预填上次使用的 lastSaveDir
+if (process.env.SAVE_DIR) {
+  config.saveDir = process.env.SAVE_DIR;
+  config.saveDirFixed = true;
+} else if (config.saveDirFixed && config.saveDir) {
+  // config.json 中显式固定，沿用
+} else {
+  // 旧版本 config.json 总是写 saveDir，这里把它迁移为"上次使用的路径"
+  config.lastSaveDir = config.lastSaveDir || config.saveDir || SAVE_DIR_DEFAULT;
+  config.saveDir = SAVE_DIR_DEFAULT;
+  config.saveDirFixed = false;
+}
 if (!config.name) config.name = `${os.hostname().replace(/\.local\.?$/, '')} (${PLATFORM_NAME})`;
 if (process.env.NAME) config.name = process.env.NAME;
 
@@ -79,8 +93,10 @@ ensureNodeId();
 
 function saveConfig() {
   try {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(
-      { id: config.id, name: config.name, saveDir: config.saveDir }, null, 2));
+    const out = { id: config.id, name: config.name, saveDirFixed: !!config.saveDirFixed };
+    if (config.saveDirFixed) out.saveDir = config.saveDir;
+    if (config.lastSaveDir) out.lastSaveDir = config.lastSaveDir;
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(out, null, 2));
   } catch (_) { /* 配置写失败不致命 */ }
 }
 saveConfig();
@@ -111,7 +127,9 @@ function localInfo() {
     name: config.name,
     os: PLATFORM_NAME,
     version: VERSION,
-    saveDir: config.saveDir,
+    saveDir: config.saveDirFixed ? config.saveDir : (config.lastSaveDir || config.saveDir),
+    saveDirFixed: !!config.saveDirFixed,
+    lastSaveDir: config.lastSaveDir || null,
     httpPort,
     ips: lanIps(),
   };
@@ -147,6 +165,17 @@ async function readJson(req, limit = 8 * 1024 * 1024) {
     return JSON.parse(buf.toString('utf8') || '{}');
   } catch (_) {
     return null;
+  }
+}
+
+/** 浏览器同源请求（Origin 缺省视为非浏览器客户端）。用于限制跨站网页指定接收路径 */
+function sameOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === (req.headers.host || '');
+  } catch (_) {
+    return false;
   }
 }
 
@@ -657,8 +686,9 @@ setInterval(() => {
 }, 3000);
 
 function finalizeOffer(offer) {
-  fs.mkdirSync(config.saveDir, { recursive: true });
-  const finalDir = uniqueDest(path.join(config.saveDir, `${safeFsName(offer.from.name)}-${tsString()}`));
+  const baseDir = offer.saveDirOverride || config.saveDir;
+  fs.mkdirSync(baseDir, { recursive: true });
+  const finalDir = uniqueDest(path.join(baseDir, `${safeFsName(offer.from.name)}-${tsString()}`));
   try {
     fs.renameSync(offer.tmpDir, finalDir);
   } catch (err) {
@@ -853,12 +883,41 @@ async function handleApi(req, res, pathname, q) {
     const offer = offers.get(m[1]);
     if (!offer) return sendJson(res, 404, { error: '任务不存在' });
     if (offer.status !== 'pending') return sendJson(res, 409, { error: '当前状态无法接受' });
+    const body = (await readJson(req, 64 * 1024)) || {};
+
+    // 本次接收的保存目录：弹窗可改；未提供则用固定/默认目录
+    let override = null;
+    if (body.saveDir !== undefined && body.saveDir !== null && String(body.saveDir).trim()) {
+      const raw = String(body.saveDir).trim();
+      if (raw.length > 500) return sendJson(res, 400, { error: '路径过长' });
+      if (!path.isAbsolute(raw)) return sendJson(res, 400, { error: '请填写绝对路径' });
+      // 自定义路径仅接受同源页面，防止其他网页跨站指定任意目录
+      if (!sameOrigin(req)) return sendJson(res, 403, { error: '跨站请求不接受自定义路径' });
+      override = path.resolve(raw);
+      config.lastSaveDir = override;
+      if (body.always === true) {
+        config.saveDir = override;
+        config.saveDirFixed = true;
+      }
+      saveConfig();
+      try {
+        fs.mkdirSync(override, { recursive: true });
+      } catch (err) {
+        return sendJson(res, 400, { error: `无法创建目录：${err.message}` });
+      }
+    }
+    offer.saveDirOverride = override;
     offer.status = 'accepted';
     offer.lastActivity = Date.now();
     offer.tmpDir = path.join(os.tmpdir(), `feiq-${offer.id}`);
     fs.mkdirSync(offer.tmpDir, { recursive: true });
     broadcastUpdate(offer);
-    return sendJson(res, 200, { ok: true, token: offer.token });
+    return sendJson(res, 200, {
+      ok: true,
+      token: offer.token,
+      saveDir: override || config.saveDir,
+      saveDirFixed: !!config.saveDirFixed,
+    });
   }
 
   m = pathname.match(/^\/api\/transfer\/reject\/([\w-]+)$/);
