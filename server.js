@@ -23,7 +23,7 @@ const crypto = require('crypto');
 const { exec } = require('child_process');
 
 // ---------------- 常量 ----------------
-const VERSION = '1.1.2';
+const VERSION = '1.2.0';
 const HTTP_PORT_BASE = parseInt(process.env.PORT || '3210', 10);
 const UDP_PORT_BASE = parseInt(process.env.UDP_PORT || '32101', 10);
 const UDP_PORT_RANGE = 5;              // UDP 同时向 32101..32105 发送/监听
@@ -50,6 +50,32 @@ if (!config.saveDir) config.saveDir = SAVE_DIR_DEFAULT;
 if (process.env.SAVE_DIR) config.saveDir = process.env.SAVE_DIR;
 if (!config.name) config.name = `${os.hostname().replace(/\.local\.?$/, '')} (${PLATFORM_NAME})`;
 if (process.env.NAME) config.name = process.env.NAME;
+
+/**
+ * id 内嵌本机 IP（格式：<ip>-<uuid>）。
+ * 项目文件夹拷贝到其他机器后，启动时检测到 id 中的 IP 与本机 IP 不一致，
+ * 自动改写为本机 IP（保留 uuid 部分），从源头避免局域网 id 冲突。
+ */
+function buildNodeId() {
+  return `${lanIps()[0] || '127.0.0.1'}-${crypto.randomUUID()}`;
+}
+function ensureNodeId() {
+  const localIp = lanIps()[0] || '127.0.0.1';
+  if (!config.id) {
+    config.id = buildNodeId();
+    return;
+  }
+  const m = /^(\d+\.\d+\.\d+\.\d+)-(.+)$/.exec(config.id);
+  if (!m) {
+    // 旧格式（纯 uuid）：升级为含 IP 的新格式，保留原 uuid
+    config.id = `${localIp}-${config.id}`;
+    console.log(`[配置] id 已升级为含本机 IP 的格式：${config.id.slice(0, 13)}…`);
+  } else if (m[1] !== localIp) {
+    console.log(`[配置] config.json 中 id 内嵌的 IP（${m[1]}）与本机 IP（${localIp}）不一致，已改写，避免拷贝导致的 id 冲突`);
+    config.id = `${localIp}-${m[2]}`;
+  }
+}
+ensureNodeId();
 
 function saveConfig() {
   try {
@@ -456,7 +482,7 @@ function isMyIp(host) {
  */
 function regenerateId(reason) {
   const old = config.id;
-  config.id = crypto.randomUUID();
+  config.id = buildNodeId();
   saveConfig();
   console.warn(`[配置] ${reason}，已自动重新生成本机 id（${old.slice(0, 8)}… → ${config.id.slice(0, 8)}…）`);
   announceAll();
@@ -960,6 +986,7 @@ async function main() {
 
   console.log('');
   console.log('  feiq-glm 局域网互传已启动');
+  console.log(`  本机 id：${config.id}`);
   console.log(`  本机名称：${config.name}`);
   console.log(`  本机访问：http://localhost:${httpPort}`);
   for (const ip of lanIps()) {
