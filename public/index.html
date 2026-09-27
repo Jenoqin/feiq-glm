@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>feiq-glm · 局域网互传</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📤</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <div class="brand">
+    <span class="brand-icon">📤</span>
+    <div>
+      <h1>feiq-glm</h1>
+      <p>局域网文件互传</p>
+    </div>
+  </div>
+
+  <div class="me-card">
+    <label class="me-label" for="me-name">本机名称（可修改）</label>
+    <input id="me-name" maxlength="40" autocomplete="off">
+    <div class="me-meta" id="me-meta"></div>
+  </div>
+
+  <div class="add-peer">
+    <input id="add-input" placeholder="手动添加 IP:端口" autocomplete="off">
+    <button id="add-btn">添加</button>
+  </div>
+
+  <div class="peer-head">
+    <span>局域网节点</span>
+    <span id="peer-count" class="peer-count"></span>
+  </div>
+  <ul id="peer-list" class="peer-list"></ul>
+</aside>
+
+<main class="main">
+  <div id="welcome" class="welcome">
+    <div class="welcome-icon">📡</div>
+    <h2>欢迎使用 feiq-glm</h2>
+    <ul>
+      <li>同一局域网内的节点会<strong>自动发现</strong>，也可在左下角手动输入 IP 添加</li>
+      <li>选中左侧节点，<strong>拖拽文件或文件夹</strong>即可发送，接收方确认后直接保存到对方电脑</li>
+      <li>支持<strong>整个文件夹</strong>传输，自动保留目录结构</li>
+      <li>还可以在下方与对方<strong>互发文本消息</strong></li>
+    </ul>
+  </div>
+
+  <div id="session" class="session hidden">
+    <header class="session-head">
+      <div class="avatar" id="sel-avatar"></div>
+      <div class="sel-info">
+        <h2 id="sel-name"></h2>
+        <p id="sel-meta"></p>
+      </div>
+      <span class="online-badge" id="sel-online">在线</span>
+    </header>
+
+    <div class="dropzone" id="dropzone">
+      <div class="dz-icon">📂</div>
+      <p class="dz-title">拖拽文件或文件夹到此处发送</p>
+      <p class="dz-sub">或</p>
+      <div class="dz-actions">
+        <button id="pick-files-btn" class="btn primary">选择文件</button>
+        <button id="pick-folder-btn" class="btn ghost">选择文件夹</button>
+      </div>
+    </div>
+
+    <section class="transfers">
+      <h3>传输列表</h3>
+      <div class="tgroup">
+        <h4>发送</h4>
+        <div id="send-items" class="titems"><p class="empty">暂无发送任务</p></div>
+      </div>
+      <div class="tgroup">
+        <h4>接收</h4>
+        <div id="recv-items" class="titems"><p class="empty">暂无接收任务</p></div>
+      </div>
+    </section>
+
+    <section class="chat">
+      <div id="chat-list" class="chat-list"></div>
+      <div class="chat-input">
+        <input id="chat-text" placeholder="输入消息，回车发送…" maxlength="5000" autocomplete="off">
+        <button id="chat-send" class="btn primary">发送</button>
+      </div>
+    </section>
+  </div>
+</main>
+
+<div id="modal-root"></div>
+<div id="toast-root" class="toast-root"></div>
+
+<input type="file" id="pick-files" multiple hidden>
+<input type="file" id="pick-folder" webkitdirectory hidden>
+
+<script src="app.js"></script>
+</body>
+</html>

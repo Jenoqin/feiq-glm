@@ -1,0 +1,9 @@
+# 本机运行时生成
+config.json
+nohup.out
+
+# 测试与本地会话产物
+gui-test-screenshots/
+.zcode/
+
+.DS_Store
