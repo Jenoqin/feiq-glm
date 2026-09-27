@@ -76,7 +76,8 @@ input { font-family: inherit; }
 .add-peer { display: flex; gap: 6px; padding: 12px 12px 4px; }
 .add-peer input {
   flex: 1;
-  padding: 7px 10px;
+  min-width: 0;
+  padding: 7px 8px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fff;
@@ -85,15 +86,18 @@ input { font-family: inherit; }
 }
 .add-peer input:focus { border-color: var(--accent); }
 .add-peer button {
-  padding: 0 12px;
+  padding: 0 10px;
   border: none;
   border-radius: 8px;
   background: var(--accent);
   color: #fff;
   font-size: 12px;
   cursor: pointer;
+  white-space: nowrap;
 }
 .add-peer button:hover { filter: brightness(1.08); }
+.add-peer button:disabled { opacity: .6; cursor: wait; }
+#scan-btn { background: #64748b; }
 
 .peer-head {
   display: flex;

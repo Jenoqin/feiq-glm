@@ -14,6 +14,7 @@
 'use strict';
 
 const http = require('http');
+const net = require('net');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
@@ -22,7 +23,7 @@ const crypto = require('crypto');
 const { exec } = require('child_process');
 
 // ---------------- 常量 ----------------
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const HTTP_PORT_BASE = parseInt(process.env.PORT || '3210', 10);
 const UDP_PORT_BASE = parseInt(process.env.UDP_PORT || '32101', 10);
 const UDP_PORT_RANGE = 5;              // UDP 同时向 32101..32105 发送/监听
@@ -242,13 +243,36 @@ function udpPortList() {
   return arr;
 }
 
+function ipToInt(ip) {
+  return ip.split('.').reduce((acc, o) => ((acc << 8) + (parseInt(o, 10) || 0)) >>> 0, 0);
+}
+function intToIp(n) {
+  return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
+}
+function maskOf(prefix) {
+  return prefix === 0 ? 0 : (0xFFFFFFFF << (32 - prefix)) >>> 0;
+}
+/** 按 CIDR 计算真实的子网定向广播地址（兼容 /28、/23 等非 /24 网段） */
+function broadcastOf(ip, prefix) {
+  const ipInt = ipToInt(ip);
+  const mask = maskOf(prefix);
+  const bc = (ipInt & mask) | (~mask >>> 0);
+  return intToIp(bc);
+}
+
 function broadcastAddrs() {
   const out = new Set(['255.255.255.255']);
   for (const list of Object.values(os.networkInterfaces())) {
     for (const ni of list) {
       if (ni.family !== 'IPv4' || ni.internal) continue;
-      const seg = ni.address.split('.');
-      if (seg.length === 4) out.add(`${seg[0]}.${seg[1]}.${seg[2]}.255`);
+      if (ni.cidr) {
+        const [ip, prefixStr] = ni.cidr.split('/');
+        const prefix = parseInt(prefixStr, 10);
+        if (prefix >= 0 && prefix <= 32) out.add(broadcastOf(ip, prefix));
+      } else {
+        const seg = ni.address.split('.');
+        if (seg.length === 4) out.add(`${seg[0]}.${seg[1]}.${seg[2]}.255`);
+      }
     }
   }
   return [...out];
@@ -294,6 +318,7 @@ function onDiscoveryMessage(buf, rinfo) {
   p.manual = false;
   peers.set(msg.id, p);
   touchPeers();
+  if (!known) console.log(`[发现] 新节点：${p.name} (${p.host}:${p.httpPort})`);
 
   // 新节点上线时单播回送一次自己的 announce，加速相互发现
   if (now - (p._repliedAt || 0) > 5000) {
@@ -400,6 +425,89 @@ setInterval(() => {
     }).catch(() => {});
   }
 }, 5000);
+
+// ---------------- 网段扫描（UDP 广播被拦截时的兜底发现） ----------------
+const SCAN_PORTS = [...new Set([HTTP_PORT_BASE, 3210, 3211, 3212])];
+
+function upsertPeer(info, host, port, manual) {
+  const p = peers.get(info.id) || { id: info.id };
+  Object.assign(p, {
+    id: info.id, name: info.name, os: info.os,
+    host, httpPort: port, manual: !!manual, lastSeen: Date.now(),
+  });
+  peers.set(info.id, p);
+  touchPeers();
+  return p;
+}
+
+function scanSubnets() {
+  return new Promise((resolve) => {
+    const hosts = new Set();
+    const seenNets = new Set();
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const ni of list) {
+        if (ni.family !== 'IPv4' || ni.internal || !ni.cidr) continue;
+        const [ip, prefixStr] = ni.cidr.split('/');
+        const prefix = parseInt(prefixStr, 10);
+        if (prefix < 22 || prefix > 30) continue;        // 网段过大不扫，避免海量探测
+        if (ip.startsWith('169.254.')) continue;         // 链路本地
+        const netInt = ipToInt(ip) & maskOf(prefix);
+        const key = `${netInt}/${prefix}`;
+        if (seenNets.has(key)) continue;
+        seenNets.add(key);
+        const size = 2 ** (32 - prefix);
+        const max = Math.min(size - 1, 1024);            // 单网段最多探测 1024 个地址
+        for (let i = 1; i < max; i++) hosts.add(intToIp(netInt + i));
+      }
+    }
+    if (!hosts.size) return resolve(0);
+
+    const pairs = [];
+    for (const h of hosts) for (const p of SCAN_PORTS) pairs.push([h, p]);
+
+    const found = new Set();
+    let idx = 0;
+    let done = 0;
+    const total = pairs.length;
+    const startedAt = Date.now();
+    const CONCURRENCY = 96;
+    const CONNECT_TIMEOUT = 250;
+
+    const probe = ([host, port]) => new Promise((resolvePair) => {
+      const sock = net.createConnection({ host, port });
+      let settled = false;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        sock.destroy();
+        resolvePair(ok);
+      };
+      sock.setTimeout(CONNECT_TIMEOUT, () => finish(false));
+      sock.on('connect', () => finish(true));
+      sock.on('error', () => finish(false));
+    });
+
+    const worker = async () => {
+      while (idx < total && Date.now() - startedAt < 10000) {
+        const pair = pairs[idx++];
+        if (await probe(pair)) {
+          const info = await fetchInfo(pair[0], pair[1], 800);
+          if (info && info.id && info.id !== config.id) {
+            upsertPeer(info, pair[0], pair[1], true);
+            found.add(info.id);
+          }
+        }
+        done++;
+      }
+    };
+    const workers = Array.from({ length: Math.min(CONCURRENCY, total) }, worker);
+    (async () => {
+      await Promise.all(workers);
+      console.log(`[扫描] 探测 ${total} 个地址，发现 ${found.size} 个节点，耗时 ${Date.now() - startedAt}ms`);
+      resolve(found.size);
+    })();
+  });
+}
 
 // 离线清理
 setInterval(() => {
@@ -592,6 +700,10 @@ async function handleApi(req, res, pathname, q) {
     peers.set(info.id, p);
     touchPeers();
     return sendJson(res, 200, { ok: true, peer: publicPeer(p) });
+  }
+  if (pathname === '/api/scan' && method === 'POST') {
+    const found = await scanSubnets();
+    return sendJson(res, 200, { ok: true, found });
   }
   if (pathname === '/api/message' && method === 'POST') {
     const body = await readJson(req, 256 * 1024);
@@ -789,8 +901,17 @@ async function main() {
   for (const ip of lanIps()) {
     console.log(`  局域网访问：http://${ip}:${httpPort}`);
   }
+  console.log(`  发现广播目标：${broadcastAddrs().join(', ')} (UDP ${udpPort || '未绑定'})`);
   console.log(`  接收目录：${config.saveDir}`);
   console.log('');
+
+  // 启动后一段时间仍无节点时自动扫描一次网段（广播被防火墙/VPN 拦截的兜底）
+  setTimeout(() => {
+    if (peers.size === 0) {
+      console.log('[发现] 尚未发现任何节点，自动扫描网段…');
+      scanSubnets();
+    }
+  }, 12000);
 
   openBrowser();
 }

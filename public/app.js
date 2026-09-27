@@ -173,7 +173,7 @@ function renderPeers() {
   $('#peer-count').textContent = `${onlineCount} 在线 / 共 ${peers.length}`;
 
   if (!peers.length) {
-    list.innerHTML = '<li class="peer-empty">正在搜索局域网节点…<br>也可在上方手动添加</li>';
+    list.innerHTML = '<li class="peer-empty">正在搜索局域网节点…<br>找不到？点上方「扫描」搜索网段，<br>或检查防火墙后手动添加</li>';
     return;
   }
   list.innerHTML = peers.map((p) => {
@@ -618,6 +618,22 @@ $('#add-btn').addEventListener('click', async () => {
 });
 $('#add-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') $('#add-btn').click();
+});
+
+$('#scan-btn').addEventListener('click', async () => {
+  const btn = $('#scan-btn');
+  btn.disabled = true;
+  btn.textContent = '扫描中';
+  toast('正在扫描本机网段，约需几秒…');
+  try {
+    const r = await fetchJSON('/api/scan', 'POST', {}, 20000);
+    toast(r.found ? `扫描完成，发现 ${r.found} 个节点` : '扫描完成，未发现新节点', r.found ? 'ok' : '');
+  } catch (err) {
+    toast(`扫描失败：${err.message}`, 'bad');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '扫描';
+  }
 });
 
 $('#me-name').addEventListener('change', async (e) => {
