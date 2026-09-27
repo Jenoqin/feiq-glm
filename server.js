@@ -23,7 +23,7 @@ const crypto = require('crypto');
 const { exec } = require('child_process');
 
 // ---------------- 常量 ----------------
-const VERSION = '1.1.0';
+const VERSION = '1.1.2';
 const HTTP_PORT_BASE = parseInt(process.env.PORT || '3210', 10);
 const UDP_PORT_BASE = parseInt(process.env.UDP_PORT || '32101', 10);
 const UDP_PORT_RANGE = 5;              // UDP 同时向 32101..32105 发送/监听
@@ -305,7 +305,14 @@ function onDiscoveryMessage(buf, rinfo) {
     if (msg.id && peers.delete(msg.id)) touchPeers();
     return;
   }
-  if (msg.type !== 'announce' || !msg.id || msg.id === config.id) return;
+  if (msg.type !== 'announce' || !msg.id) return;
+  if (msg.id === config.id) {
+    // 同 id 但来自其他 IP：配置文件被整份拷贝过，自愈
+    if (!isMyIp(rinfo.address)) {
+      regenerateId(`收到来自 ${rinfo.address} 的同 id announce`);
+    }
+    return;
+  }
 
   const now = Date.now();
   const known = peers.get(msg.id);
@@ -427,9 +434,8 @@ setInterval(() => {
 }, 5000);
 
 // ---------------- 网段扫描（UDP 广播被拦截时的兜底发现） ----------------
-const SCAN_PORTS = [...new Set([HTTP_PORT_BASE, 3210, 3211, 3212])];
-
 function upsertPeer(info, host, port, manual) {
+  const isNew = !peers.has(info.id);
   const p = peers.get(info.id) || { id: info.id };
   Object.assign(p, {
     id: info.id, name: info.name, os: info.os,
@@ -437,8 +443,77 @@ function upsertPeer(info, host, port, manual) {
   });
   peers.set(info.id, p);
   touchPeers();
+  return { p, isNew };
+}
+
+function isMyIp(host) {
+  return host === '127.0.0.1' || host === 'localhost' || lanIps().includes(host);
+}
+
+/**
+ * 发现同 id 但不同 IP 的节点 = 配置文件被整份拷贝过。
+ * 自动重新生成本机 id，否则双方会互相当成自己而忽略对方的所有广播。
+ */
+function regenerateId(reason) {
+  const old = config.id;
+  config.id = crypto.randomUUID();
+  saveConfig();
+  console.warn(`[配置] ${reason}，已自动重新生成本机 id（${old.slice(0, 8)}… → ${config.id.slice(0, 8)}…）`);
+  announceAll();
+}
+
+/** 统一的节点接纳入口：处理撞 id 自愈、去重、登记与新节点的反向注册 */
+function acceptDiscoveredNode(info, host, port, manual) {
+  if (!info || !info.id) return null;
+  if (info.id === config.id) {
+    if (isMyIp(host)) return null;               // 探测到的是自己，忽略
+    regenerateId(`发现同 id 节点 ${host}:${port}（config.json 可能被整份拷贝过）`);
+  }
+  const { p, isNew } = upsertPeer(info, host, port, manual);
+  if (isNew) {
+    console.log(`[发现] 新节点：${p.name} (${p.host}:${p.httpPort})`);
+    registerSelfTo(host, port);
+  }
   return p;
 }
+
+/** 挑选与对端同网段的本机 IP，作为对端回连自己的地址 */
+function myIpFor(peerHost) {
+  const peerInt = ipToInt(peerHost);
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const ni of list) {
+      if (ni.family !== 'IPv4' || ni.internal || !ni.cidr) continue;
+      const [ip, prefixStr] = ni.cidr.split('/');
+      const mask = maskOf(parseInt(prefixStr, 10));
+      if ((ipToInt(ip) & mask) === (peerInt & mask)) return ip;
+    }
+  }
+  return lanIps()[0] || null;
+}
+
+/** 把本机注册到对方（对方用现有 /api/discover 反向添加我们），实现单向发现、双向可见 */
+function registerSelfTo(peerHost, peerPort) {
+  const myIp = myIpFor(peerHost);
+  if (!myIp) return;
+  const body = JSON.stringify({ host: myIp, port: httpPort });
+  const req = http.request({
+    host: peerHost, port: peerPort, path: '/api/discover', method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    timeout: 3000,
+  }, () => req.destroy());
+  req.on('error', () => {});
+  req.on('timeout', () => req.destroy());
+  req.end(body);
+}
+
+function discoverPeer(host, port) {
+  return fetchInfo(host, port).then((info) => {
+    if (!info) return null;
+    return acceptDiscoveredNode(info, host, port, true);
+  });
+}
+
+const SCAN_PORTS = [...new Set([HTTP_PORT_BASE, 3210, 3211, 3212])];
 
 function scanSubnets() {
   return new Promise((resolve) => {
@@ -467,11 +542,10 @@ function scanSubnets() {
 
     const found = new Set();
     let idx = 0;
-    let done = 0;
     const total = pairs.length;
     const startedAt = Date.now();
-    const CONCURRENCY = 96;
-    const CONNECT_TIMEOUT = 250;
+    const CONCURRENCY = 64;
+    const CONNECT_TIMEOUT = 900;
 
     const probe = ([host, port]) => new Promise((resolvePair) => {
       const sock = net.createConnection({ host, port });
@@ -488,16 +562,13 @@ function scanSubnets() {
     });
 
     const worker = async () => {
-      while (idx < total && Date.now() - startedAt < 10000) {
+      while (idx < total && Date.now() - startedAt < 20000) {
         const pair = pairs[idx++];
         if (await probe(pair)) {
-          const info = await fetchInfo(pair[0], pair[1], 800);
-          if (info && info.id && info.id !== config.id) {
-            upsertPeer(info, pair[0], pair[1], true);
-            found.add(info.id);
-          }
+          const info = await fetchInfo(pair[0], pair[1], 1200);
+          const p = acceptDiscoveredNode(info, pair[0], pair[1], true);
+          if (p) found.add(p.id);
         }
-        done++;
       }
     };
     const workers = Array.from({ length: Math.min(CONCURRENCY, total) }, worker);
@@ -690,15 +761,8 @@ async function handleApi(req, res, pathname, q) {
     const host = String(body.host || '').trim();
     const port = parseInt(body.port, 10) || 3210;
     if (!host || port < 1 || port > 65535) return sendJson(res, 400, { error: '地址无效' });
-    const info = await fetchInfo(host, port);
-    if (!info) return sendJson(res, 502, { error: '无法连接该节点' });
-    const p = peers.get(info.id) || { id: info.id };
-    Object.assign(p, {
-      id: info.id, name: info.name, os: info.os,
-      host, httpPort: port, manual: true, lastSeen: Date.now(),
-    });
-    peers.set(info.id, p);
-    touchPeers();
+    const p = await discoverPeer(host, port);
+    if (!p) return sendJson(res, 502, { error: '无法连接该节点' });
     return sendJson(res, 200, { ok: true, peer: publicPeer(p) });
   }
   if (pathname === '/api/scan' && method === 'POST') {
